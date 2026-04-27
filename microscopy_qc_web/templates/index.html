@@ -9,20 +9,19 @@
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Instrument+Serif:ital@0;1&family=Inter+Tight:wght@400;500;600;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Instrument+Serif:ital@0;1&family=Inter+Tight:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 
 <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
 
-<!-- ═══════════ TOP BAR ═══════════ -->
 <header class="topbar">
   <div class="topbar-left">
     <div class="brand">
       <span class="brand-mark">◉</span>
       <span class="brand-name">MicroScope</span><span class="brand-sub">QC</span>
     </div>
-    <div class="brand-tag">v1.0 · Image Quality Analysis Engine</div>
+    <div class="brand-tag" id="versionTag">v2.0 · Image Quality Analysis Engine</div>
   </div>
   <div class="topbar-right">
     <div class="status-pill" id="apiStatus">
@@ -32,8 +31,9 @@
   </div>
 </header>
 
-<!-- ═══════════ HERO / EMPTY STATE ═══════════ -->
 <main id="appMain">
+
+  <!-- ═══════════ HERO ═══════════ -->
   <section class="hero" id="hero">
     <div class="hero-grid">
       <div class="hero-left">
@@ -44,19 +44,19 @@
         </h1>
         <p class="hero-lede">
           Upload any microscopy image — blood smear, histology, fluorescence, brightfield —
-          and get an instant quality verdict. Four metrics, one score, transparent reasoning.
+          and get an auditable quality verdict. Every conclusion is backed by a measured value,
+          a documented threshold, and a deterministic decision rule.
         </p>
 
         <div class="metric-callouts">
-          <div class="callout"><span class="callout-num">01</span><span class="callout-name">Sharpness</span><span class="callout-desc">Laplacian · Brenner · Tenengrad</span></div>
-          <div class="callout"><span class="callout-num">02</span><span class="callout-name">Lighting</span><span class="callout-desc">Tile-CV · Saturation · Histogram</span></div>
-          <div class="callout"><span class="callout-num">03</span><span class="callout-name">Noise</span><span class="callout-desc">σ Estimator · SNR · FFT Ringing</span></div>
-          <div class="callout"><span class="callout-num">04</span><span class="callout-name">Density</span><span class="callout-desc">Adaptive Threshold · Contour · CV</span></div>
+          <div class="callout"><span class="callout-num">01</span><span class="callout-name">Sharpness</span><span class="callout-desc">Laplacian · Tenengrad · Edge density · FFT</span></div>
+          <div class="callout"><span class="callout-num">02</span><span class="callout-name">Lighting</span><span class="callout-desc">Exposure · Tile-CV · Vignette · Saturation</span></div>
+          <div class="callout"><span class="callout-num">03</span><span class="callout-name">Noise</span><span class="callout-desc">Immerkær σ · SNR · Salt-and-pepper</span></div>
+          <div class="callout"><span class="callout-num">04</span><span class="callout-name">Density</span><span class="callout-desc">CLAHE · Watershed · Solidity · Spatial CV</span></div>
         </div>
       </div>
 
       <div class="hero-right">
-        <!-- ═══════════ UPLOAD ZONE ═══════════ -->
         <div class="upload-zone" id="dropZone">
           <input type="file" id="fileInput" accept="image/*" hidden />
           <div class="upload-frame">
@@ -103,7 +103,7 @@
     </div>
   </section>
 
-  <!-- ═══════════ LOADING STATE ═══════════ -->
+  <!-- ═══════════ LOADING ═══════════ -->
   <section class="loading-section hidden" id="loadingSection">
     <div class="loading-inner">
       <div class="scanner">
@@ -115,14 +115,15 @@
         <div class="loading-step" data-step="1">► illumination uniformity</div>
         <div class="loading-step" data-step="2">► noise &amp; artifact detection</div>
         <div class="loading-step" data-step="3">► cell density mapping</div>
+        <div class="loading-step" data-step="4">► verdict reasoning</div>
       </div>
     </div>
   </section>
 
-  <!-- ═══════════ RESULTS SECTION ═══════════ -->
+  <!-- ═══════════ RESULTS ═══════════ -->
   <section class="results-section hidden" id="resultsSection">
 
-    <!-- ── SCORE BANNER ── -->
+    <!-- VERDICT BANNER -->
     <div class="score-banner" id="scoreBanner">
       <div class="score-banner-grid">
         <div class="score-main">
@@ -131,7 +132,13 @@
             <span class="score-num" id="overallScore">—</span>
             <span class="score-denom">/ 100</span>
           </div>
-          <div class="score-label" id="scoreLabel">— —</div>
+          <div class="verdict-block">
+            <div class="score-label" id="scoreLabel">— —</div>
+            <div class="confidence-block">
+              <span class="confidence-label">CONFIDENCE</span>
+              <span class="confidence-value" id="confidenceValue">—</span>
+            </div>
+          </div>
         </div>
 
         <div class="score-meter">
@@ -147,8 +154,9 @@
             <circle cx="120" cy="120" r="100" stroke="url(#meterGrad)" stroke-width="3" fill="none"
                     stroke-dasharray="628.3" stroke-dashoffset="628.3"
                     transform="rotate(-90 120 120)" id="meterArc" stroke-linecap="round"/>
-            <!-- tick marks -->
             <g id="meterTicks"></g>
+            <line x1="120" y1="40" x2="120" y2="50" stroke="rgba(255,255,255,0.4)" stroke-width="1.5"/>
+            <text x="120" y="32" fill="rgba(255,255,255,0.4)" font-family="JetBrains Mono" font-size="9" text-anchor="middle">100</text>
           </svg>
         </div>
 
@@ -156,16 +164,31 @@
           <div class="kicker">— Image Profile</div>
           <table class="info-table">
             <tr><td>Dimensions</td><td id="infoDim">—</td></tr>
-            <tr><td>Issues found</td><td id="infoIssues">—</td></tr>
-            <tr><td>Critical</td><td id="infoCritical">—</td></tr>
+            <tr><td>Critical findings</td><td id="infoCritical">—</td></tr>
+            <tr><td>Warnings</td><td id="infoWarnings">—</td></tr>
             <tr><td>Recommendation</td><td id="infoRec">—</td></tr>
+            <tr><td>Analyzer</td><td id="infoVersion">—</td></tr>
           </table>
           <button class="btn-tertiary" id="newAnalysisBtn">↻ NEW ANALYSIS</button>
         </div>
       </div>
     </div>
 
-    <!-- ── METRICS GRID ── -->
+    <!-- DECISION TRAIL -->
+    <div class="decision-section">
+      <div class="section-head">
+        <div class="kicker">— Decision Trail</div>
+        <h2>How this verdict was reached</h2>
+      </div>
+      <ol class="decision-trail" id="decisionTrail"></ol>
+
+      <div class="blockers-block hidden" id="blockersBlock">
+        <div class="blockers-title">Blocking findings</div>
+        <div class="blockers-list" id="blockersList"></div>
+      </div>
+    </div>
+
+    <!-- METRICS -->
     <div class="metrics-grid">
       <div class="metric-card" id="cardBlur" data-metric="blur">
         <div class="metric-head">
@@ -181,7 +204,6 @@
         <div class="metric-raw"></div>
         <div class="metric-issues"></div>
       </div>
-
       <div class="metric-card" id="cardLighting" data-metric="lighting">
         <div class="metric-head">
           <div class="metric-num">02</div>
@@ -196,7 +218,6 @@
         <div class="metric-raw"></div>
         <div class="metric-issues"></div>
       </div>
-
       <div class="metric-card" id="cardNoise" data-metric="noise">
         <div class="metric-head">
           <div class="metric-num">03</div>
@@ -211,7 +232,6 @@
         <div class="metric-raw"></div>
         <div class="metric-issues"></div>
       </div>
-
       <div class="metric-card" id="cardDensity" data-metric="density">
         <div class="metric-head">
           <div class="metric-num">04</div>
@@ -228,7 +248,7 @@
       </div>
     </div>
 
-    <!-- ── VISUALIZATIONS ── -->
+    <!-- VISUALIZATIONS -->
     <div class="viz-section">
       <div class="section-head">
         <div class="kicker">— Diagnostics</div>
@@ -246,7 +266,7 @@
         <div class="viz-content active" data-content="cells">
           <div class="viz-image-wrap">
             <img id="annotatedImg" alt="Cell detection" />
-            <div class="viz-caption">Detected cells outlined in mint. Adaptive thresholding + contour detection.</div>
+            <div class="viz-caption">Cells detected via CLAHE + adaptive threshold + watershed splitting.</div>
           </div>
         </div>
         <div class="viz-content" data-content="heatmap">
@@ -281,11 +301,17 @@
       </div>
     </div>
 
-    <!-- ── ISSUES SUMMARY ── -->
+    <!-- FINDINGS LEDGER -->
     <div class="issues-section">
       <div class="section-head">
-        <div class="kicker">— Findings</div>
-        <h2>What we detected</h2>
+        <div class="kicker">— Findings Ledger</div>
+        <h2>All measurements &amp; rules</h2>
+      </div>
+      <div class="findings-controls">
+        <button class="filter-btn active" data-filter="all">ALL</button>
+        <button class="filter-btn" data-filter="fail">CRITICAL</button>
+        <button class="filter-btn" data-filter="warn">WARNINGS</button>
+        <button class="filter-btn" data-filter="pass">PASSING</button>
       </div>
       <ul class="issues-list" id="issuesList"></ul>
     </div>
@@ -293,12 +319,11 @@
   </section>
 </main>
 
-<!-- ═══════════ FOOTER ═══════════ -->
 <footer class="footer">
   <div class="footer-left">
     <span class="mono">MicroScope QC</span> ·
     Built with OpenCV, NumPy, FastAPI ·
-    <span class="mono">No deep learning</span>
+    <span class="mono">Auditable rules · No black boxes</span>
   </div>
   <div class="footer-right">
     <span class="mono">EDGE</span>
@@ -306,7 +331,6 @@
   </div>
 </footer>
 
-<!-- ═══════════ NOISE TEXTURE ═══════════ -->
 <div class="grain"></div>
 
 <script src="/static/script.js"></script>
