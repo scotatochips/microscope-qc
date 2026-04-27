@@ -82,7 +82,7 @@ async def health():
 
 @app.post("/api/analyze")
 async def analyze(file: UploadFile = File(...)):
-    if not file.content_type or not file.content_type.startswith("image/"):
+    if not file.content_type or not str(file.content_type).startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
 
     contents = await file.read()
