@@ -1,8 +1,8 @@
 /* ═══════════════════════════════════════════════════════════════
-   MicroScope QC — Frontend Logic
+   MicroScope QC v2 — Frontend Logic
    ═══════════════════════════════════════════════════════════════ */
 
-const $ = (sel) => document.querySelector(sel);
+const $  = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
 
 const els = {
@@ -17,7 +17,6 @@ const els = {
   browseBtn:    $('#browseBtn'),
   clearBtn:     $('#clearBtn'),
   analyzeBtn:   $('#analyzeBtn'),
-
   hero:         $('#hero'),
   loading:      $('#loadingSection'),
   results:      $('#resultsSection'),
@@ -25,17 +24,15 @@ const els = {
 };
 
 let selectedFile = null;
+let currentReport = null;
 
-// ════════════════════════════════════════════
-// FILE SELECTION
-// ════════════════════════════════════════════
+// ════════════ FILE SELECTION ════════════
 function handleFile(file) {
   if (!file || !file.type.startsWith('image/')) {
     alert('Please select a valid image file.');
     return;
   }
   selectedFile = file;
-
   const reader = new FileReader();
   reader.onload = (e) => {
     els.previewImg.src = e.target.result;
@@ -56,22 +53,16 @@ function resetUpload() {
   els.uploadPreview.classList.add('hidden');
 }
 
-// Click handlers
 els.browseBtn.addEventListener('click', () => els.fileInput.click());
 els.uploadFrame.addEventListener('click', (e) => {
   if (e.target.closest('.upload-preview')) return;
   els.fileInput.click();
 });
-els.clearBtn.addEventListener('click', (e) => {
-  e.stopPropagation();
-  resetUpload();
-});
-
+els.clearBtn.addEventListener('click', (e) => { e.stopPropagation(); resetUpload(); });
 els.fileInput.addEventListener('change', (e) => {
   if (e.target.files[0]) handleFile(e.target.files[0]);
 });
 
-// Drag & drop
 ['dragover', 'dragenter'].forEach(ev =>
   els.uploadFrame.addEventListener(ev, (e) => {
     e.preventDefault();
@@ -89,9 +80,7 @@ els.uploadFrame.addEventListener('drop', (e) => {
 });
 
 
-// ════════════════════════════════════════════
-// ANALYSIS
-// ════════════════════════════════════════════
+// ════════════ ANALYSIS ════════════
 els.analyzeBtn.addEventListener('click', async (e) => {
   e.stopPropagation();
   if (!selectedFile) return;
@@ -105,13 +94,11 @@ els.newAnalysis.addEventListener('click', () => {
   window.scrollTo({ top: 0, behavior: 'smooth' });
 });
 
-
 async function runAnalysis(file) {
   els.hero.classList.add('hidden');
   els.results.classList.add('hidden');
   els.loading.classList.remove('hidden');
 
-  // Animate loading steps
   const steps = $$('.loading-step');
   steps.forEach(s => s.classList.remove('active', 'done'));
   let stepIdx = 0;
@@ -123,7 +110,7 @@ async function runAnalysis(file) {
       stepIdx++;
       steps[stepIdx].classList.add('active');
     }
-  }, 600);
+  }, 500);
 
   const formData = new FormData();
   formData.append('file', file);
@@ -135,10 +122,9 @@ async function runAnalysis(file) {
       throw new Error(err.detail || 'Analysis failed');
     }
     const data = await res.json();
+    currentReport = data;
     clearInterval(stepTimer);
     steps.forEach(s => { s.classList.remove('active'); s.classList.add('done'); });
-
-    // Brief pause so user sees completion
     await new Promise(r => setTimeout(r, 300));
 
     els.loading.classList.add('hidden');
@@ -154,38 +140,41 @@ async function runAnalysis(file) {
 }
 
 
-// ════════════════════════════════════════════
-// RENDER RESULTS
-// ════════════════════════════════════════════
+// ════════════ RENDERING ════════════
 function scoreColor(s) {
   if (s >= 75) return '#00e5a0';
   if (s >= 45) return '#ffb800';
   return '#ff3d5a';
 }
 
-function severityClass(sev) {
-  return { ok: 'ok', warning: 'warning', critical: 'critical' }[sev] || 'ok';
+function verdictClass(decision) {
+  return { PASS: 'pass', REVIEW: 'review', REJECT: 'reject' }[decision] || 'pass';
 }
 
 function renderResults(data) {
-  // ── Score banner ──
+  // Score
   const score = data.overall_score;
-  const scoreNum = $('#overallScore');
-  animateNumber(scoreNum, 0, score, 1200);
+  animateNumber($('#overallScore'), 0, score, 1200);
 
+  // Verdict label
   const lbl = $('#scoreLabel');
-  lbl.textContent = data.label;
-  lbl.classList.remove('good', 'bad');
-  lbl.classList.add(data.label.startsWith('GOOD') ? 'good' : 'bad');
+  const verdictTextMap = {
+    PASS:   'GOOD FOR ANALYSIS',
+    REVIEW: 'MANUAL REVIEW',
+    REJECT: 'NOT SUITABLE',
+  };
+  lbl.textContent = verdictTextMap[data.verdict.decision] || data.verdict.decision;
+  lbl.className = 'score-label ' + verdictClass(data.verdict.decision);
 
-  // Animated arc
+  // Confidence
+  $('#confidenceValue').textContent = `${Math.round(data.verdict.confidence * 100)}%`;
+
+  // Arc meter
   const arc = $('#meterArc');
-  const circumference = 628.3;
-  const offset = circumference - (score / 100) * circumference;
+  const offset = 628.3 - (score / 100) * 628.3;
   arc.style.transition = 'stroke-dashoffset 1.4s cubic-bezier(.16,1,.3,1)';
   setTimeout(() => { arc.style.strokeDashoffset = offset; }, 100);
 
-  // Tick marks
   const ticks = $('#meterTicks');
   ticks.innerHTML = '';
   for (let i = 0; i < 60; i++) {
@@ -201,99 +190,179 @@ function renderResults(data) {
 
   // Image profile
   $('#infoDim').textContent = `${data.image_info.width} × ${data.image_info.height} px`;
-  $('#infoIssues').textContent = data.summary.length;
-  const criticalCount = Object.values(data.metrics).filter(m => m.severity === 'critical').length;
-  $('#infoCritical').textContent = criticalCount;
-  $('#infoRec').textContent = score >= 60 ? 'PROCEED' : 'REJECT';
-  $('#infoRec').style.color = score >= 60 ? '#00e5a0' : '#ff3d5a';
+  let critCount = 0, warnCount = 0;
+  Object.values(data.metrics).forEach(m => {
+    m.findings.forEach(f => {
+      if (f.severity === 'fail') critCount++;
+      else if (f.severity === 'warn') warnCount++;
+    });
+  });
+  $('#infoCritical').textContent = critCount;
+  $('#infoCritical').style.color = critCount > 0 ? 'var(--danger)' : 'var(--accent)';
+  $('#infoWarnings').textContent = warnCount;
+  $('#infoWarnings').style.color = warnCount > 0 ? 'var(--warn)' : 'var(--accent)';
 
+  const recMap = {
+    PASS:   ['PROCEED',       'var(--accent)'],
+    REVIEW: ['MANUAL REVIEW', 'var(--warn)'],
+    REJECT: ['REJECT',        'var(--danger)'],
+  };
+  const [recText, recColor] = recMap[data.verdict.decision] || ['—', 'var(--text)'];
+  $('#infoRec').textContent = recText;
+  $('#infoRec').style.color = recColor;
 
-  // ── Metric cards ──
+  $('#infoVersion').textContent = `v${data.version}`;
+
+  // Decision trail
+  renderDecisionTrail(data.verdict);
+
+  // Metrics
   ['blur', 'lighting', 'noise', 'density'].forEach(key => {
-    const m = data.metrics[key];
-    const card = $(`#card${key.charAt(0).toUpperCase() + key.slice(1)}`);
-    card.classList.remove('severity-ok', 'severity-warning', 'severity-critical');
-    card.classList.add(`severity-${m.severity}`);
-
-    const numEl = card.querySelector('.ms-num');
-    animateNumber(numEl, 0, m.score, 1000);
-
-    const fill = card.querySelector('.metric-fill');
-    setTimeout(() => {
-      fill.style.width = m.score + '%';
-      fill.style.background = scoreColor(m.score);
-    }, 100);
-
-    const sev = card.querySelector('.metric-sev');
-    sev.textContent = m.severity.toUpperCase();
-    sev.className = `metric-sev ${m.severity}`;
-
-    // Raw values
-    const raw = card.querySelector('.metric-raw');
-    raw.innerHTML = Object.entries(m.raw).map(([k, v]) =>
-      `<div class="raw-row"><span>${k.replace(/_/g, ' ')}</span><span>${v}</span></div>`
-    ).join('');
-
-    // Issues
-    const issues = card.querySelector('.metric-issues');
-    if (m.issues.length === 0) {
-      issues.innerHTML = `<div class="metric-issue ok">No issues</div>`;
-    } else {
-      issues.innerHTML = m.issues.map(i =>
-        `<div class="metric-issue ${m.severity === 'critical' ? 'critical' : ''}">${i}</div>`
-      ).join('');
-    }
+    renderMetricCard(key, data.metrics[key]);
   });
 
-
-  // ── Visualizations ──
+  // Visualizations
   $('#annotatedImg').src     = data.images.annotated || data.images.original;
   $('#heatmapImg').src       = data.images.heatmap   || data.images.original;
   $('#compareOriginal').src  = data.images.original;
   $('#compareAnnotated').src = data.images.annotated || data.images.original;
-
-  // Histogram
   drawHistogram(data.histogram);
 
-  // ── Issues list ──
-  const issuesList = $('#issuesList');
-  if (data.summary.length === 0) {
-    issuesList.innerHTML = `<li class="no-issues">✓ NO ISSUES DETECTED · IMAGE PASSES ALL QUALITY CHECKS</li>`;
+  // Findings ledger
+  renderFindings(data);
+}
+
+
+function renderDecisionTrail(verdict) {
+  const trail = $('#decisionTrail');
+  trail.innerHTML = '';
+  verdict.reasoning.forEach((step, idx) => {
+    const li = document.createElement('li');
+    li.className = 'decision-step';
+    li.style.animation = `fade-up 0.4s ${idx * 0.1}s both ease`;
+    const outcomeClass = step.outcome.toLowerCase();
+    li.innerHTML = `
+      <div class="ds-label">${step.step}</div>
+      <div class="ds-detail">${step.detail}</div>
+      <div class="ds-outcome ${outcomeClass}">${step.outcome}</div>
+    `;
+    trail.appendChild(li);
+  });
+
+  const blockersBlock = $('#blockersBlock');
+  const blockersList = $('#blockersList');
+  if (verdict.blockers && verdict.blockers.length > 0) {
+    blockersBlock.classList.remove('hidden');
+    blockersList.innerHTML = verdict.blockers.map(rule =>
+      `<span class="blocker-tag">${rule}</span>`
+    ).join('');
   } else {
-    const items = [];
-    Object.entries(data.metrics).forEach(([cat, m]) => {
-      m.issues.forEach(text => {
-        items.push({ category: cat.toUpperCase(), severity: m.severity, text });
-      });
-    });
-    issuesList.innerHTML = items.map(it => `
-      <li class="issue-item">
-        <span class="issue-cat ${it.severity}">${it.category}</span>
-        <span class="issue-text">${it.text}</span>
-      </li>
-    `).join('');
+    blockersBlock.classList.add('hidden');
   }
 }
 
 
-// ════════════════════════════════════════════
-// HISTOGRAM RENDERING
-// ════════════════════════════════════════════
+function renderMetricCard(key, m) {
+  const card = $(`#card${key.charAt(0).toUpperCase() + key.slice(1)}`);
+  card.classList.remove('severity-pass', 'severity-warn', 'severity-fail');
+  card.classList.add(`severity-${m.severity}`);
+
+  animateNumber(card.querySelector('.ms-num'), 0, m.score, 1000);
+
+  const fill = card.querySelector('.metric-fill');
+  setTimeout(() => {
+    fill.style.width = m.score + '%';
+    fill.style.background = scoreColor(m.score);
+  }, 100);
+
+  const sev = card.querySelector('.metric-sev');
+  sev.textContent = m.severity.toUpperCase();
+  sev.className = `metric-sev ${m.severity}`;
+
+  const raw = card.querySelector('.metric-raw');
+  raw.innerHTML = Object.entries(m.measurements).map(([k, v]) =>
+    `<div class="raw-row"><span>${k.replace(/_/g, ' ')}</span><span>${v}</span></div>`
+  ).join('');
+
+  const issues = card.querySelector('.metric-issues');
+  if (m.findings.length === 0) {
+    issues.innerHTML = `<div class="metric-issue pass">No findings</div>`;
+  } else {
+    issues.innerHTML = m.findings.map(f =>
+      `<div class="metric-issue ${f.severity}">${f.message}</div>`
+    ).join('');
+  }
+}
+
+
+function renderFindings(data) {
+  const list = $('#issuesList');
+  const allFindings = [];
+  Object.entries(data.metrics).forEach(([cat, m]) => {
+    m.findings.forEach(f => {
+      allFindings.push({ category: cat.toUpperCase(), ...f });
+    });
+  });
+
+  // Sort: fail first, warn next, pass last
+  const order = { fail: 0, warn: 1, pass: 2 };
+  allFindings.sort((a, b) => order[a.severity] - order[b.severity]);
+
+  if (allFindings.length === 0) {
+    list.innerHTML = `<li class="no-issues">✓ NO FINDINGS</li>`;
+    return;
+  }
+
+  list.innerHTML = allFindings.map(f => `
+    <li class="issue-item" data-severity="${f.severity}">
+      <span class="issue-cat ${f.severity}">${f.severity.toUpperCase()}</span>
+      <span class="issue-rule">${f.rule_id}</span>
+      <div class="issue-content">
+        <div class="issue-message">${f.message}</div>
+        <div class="issue-formula">
+          <span class="measured">${f.metric}=${f.measured}</span>
+          <span class="threshold">${f.operator} ${f.threshold} threshold</span>
+        </div>
+        <div class="issue-impact">→ ${f.impact}</div>
+      </div>
+    </li>
+  `).join('');
+}
+
+
+// Findings filter
+$$('.filter-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    $$('.filter-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const filter = btn.dataset.filter;
+    $$('.issue-item').forEach(item => {
+      if (filter === 'all') {
+        item.classList.remove('hidden-by-filter');
+      } else {
+        if (item.dataset.severity === filter) {
+          item.classList.remove('hidden-by-filter');
+        } else {
+          item.classList.add('hidden-by-filter');
+        }
+      }
+    });
+  });
+});
+
+
+// ════════════ HISTOGRAM ════════════
 function drawHistogram(histData) {
   const svg = $('#histogramSvg');
   const W = 600, H = 240, PAD = 8;
-
   const colors = { Red: '#ff3d5a', Green: '#00e5a0', Blue: '#0099ff' };
 
-  // Find max across all channels for normalisation
   let maxVal = 0;
   Object.values(histData).forEach(arr => {
     arr.forEach(v => { if (v > maxVal) maxVal = v; });
   });
 
   let svgContent = '';
-
-  // grid lines
   for (let i = 0; i <= 4; i++) {
     const y = PAD + (H - 2*PAD) * (i / 4);
     svgContent += `<line x1="0" y1="${y}" x2="${W}" y2="${y}" stroke="#1c2330" stroke-width="0.5"/>`;
@@ -303,7 +372,6 @@ function drawHistogram(histData) {
     svgContent += `<line x1="${x}" y1="${PAD}" x2="${x}" y2="${H-PAD}" stroke="#1c2330" stroke-width="0.5"/>`;
   }
 
-  // channel paths (256 bins → SVG path)
   Object.entries(histData).forEach(([channel, data]) => {
     const colour = colors[channel];
     const points = data.map((v, i) => {
@@ -311,10 +379,8 @@ function drawHistogram(histData) {
       const y = H - PAD - (v / maxVal) * (H - 2 * PAD);
       return `${x.toFixed(1)},${y.toFixed(1)}`;
     });
-    // filled area
     const areaPath = `M 0,${H-PAD} L ` + points.join(' L ') + ` L ${W},${H-PAD} Z`;
     svgContent += `<path d="${areaPath}" fill="${colour}" opacity="0.12"/>`;
-    // line
     const linePath = 'M ' + points.join(' L ');
     svgContent += `<path d="${linePath}" fill="none" stroke="${colour}" stroke-width="1.2" opacity="0.85"/>`;
   });
@@ -323,9 +389,7 @@ function drawHistogram(histData) {
 }
 
 
-// ════════════════════════════════════════════
-// VIZ TABS
-// ════════════════════════════════════════════
+// ════════════ TABS ════════════
 $$('.viz-tab').forEach(tab => {
   tab.addEventListener('click', () => {
     const target = tab.dataset.tab;
@@ -337,12 +401,10 @@ $$('.viz-tab').forEach(tab => {
 });
 
 
-// ════════════════════════════════════════════
-// NUMBER ANIMATION
-// ════════════════════════════════════════════
+// ════════════ NUMBER ANIMATION ════════════
 function animateNumber(el, from, to, duration = 1000) {
   const start = performance.now();
-  const ease = (t) => 1 - Math.pow(1 - t, 3);  // easeOutCubic
+  const ease = (t) => 1 - Math.pow(1 - t, 3);
   function tick(now) {
     const elapsed = now - start;
     const progress = Math.min(elapsed / duration, 1);
@@ -355,11 +417,11 @@ function animateNumber(el, from, to, duration = 1000) {
 }
 
 
-// ════════════════════════════════════════════
-// API HEALTH PING
-// ════════════════════════════════════════════
-fetch('/api/health').then(r => {
-  if (!r.ok) throw new Error('offline');
+// ════════════ HEALTH PING ════════════
+fetch('/api/health').then(r => r.json()).then(data => {
+  if (data.version) {
+    $('#versionTag').textContent = `v${data.version} · Image Quality Analysis Engine`;
+  }
 }).catch(() => {
   const status = $('#apiStatus');
   status.innerHTML = '<span class="pulse" style="background:#ff3d5a;box-shadow:0 0 8px #ff3d5a"></span> SYSTEM OFFLINE';
