@@ -1,363 +1,677 @@
 """
-MicroScope QC — Advanced Microscopy Image Quality Analyzer
-===========================================================
-Detects: blur, lighting anomalies, noise/artifacts, cell density issues.
+═══════════════════════════════════════════════════════════════════════
+MicroScope QC v2.0 — Microscopy Image Quality Analyzer
+═══════════════════════════════════════════════════════════════════════
+
+Detects four classes of quality defects:
+    1. Defocus / motion blur
+    2. Illumination defects (exposure, vignetting, dynamic range)
+    3. Noise & sensor artifacts
+    4. Specimen density issues
+
+Architecture:
+    - Each metric reports SEVERITY (pass/warn/fail) independently
+    - Final verdict from deterministic rules, not just the score
+    - Every conclusion: measured value + threshold + rule ID
+    - All thresholds are auditable constants at top of file
+
+References:
+    - Pertuz et al. 2013, "Analysis of focus measure operators"
+    - Immerkær 1996, "Fast noise variance estimation"
 """
 
 import cv2
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional
+from datetime import datetime, timezone
 import warnings
 warnings.filterwarnings("ignore")
 
-# ─────────────────────────────────────────────
-# Thresholds (tuned for blood-smear microscopy)
-# ─────────────────────────────────────────────
-BLUR_GOOD       = 300.0
-BLUR_BAD        = 60.0
-BRIGHT_LOW      = 40
-BRIGHT_HIGH     = 220
-BRIGHT_IDEAL_LO = 80
-BRIGHT_IDEAL_HI = 180
-UNIFORMITY_THRESH = 50
-NOISE_GOOD      = 2.5
-NOISE_BAD       = 12.0
-DENSITY_SPARSE  = 2.0
-DENSITY_DENSE   = 65.0
-DENSITY_IDEAL_LO = 8.0
-DENSITY_IDEAL_HI = 45.0
-DENSITY_CV_THRESH = 0.60
+VERSION = "2.0.0"
 
-W_BLUR      = 0.35
-W_LIGHTING  = 0.25
-W_NOISE     = 0.20
-W_DENSITY   = 0.20
+# ═══════════ THRESHOLDS ═══════════
+BLUR_LV_FAIL  =  50.0
+BLUR_LV_WARN  = 150.0
+BLUR_LV_PASS  = 400.0
+TEN_FAIL  =   500.0
+TEN_WARN  =  3000.0
+TEN_PASS  = 12000.0
+EDGE_DENSITY_FAIL  = 0.015
+EDGE_DENSITY_WARN  = 0.040
 
+EXPOSURE_DARK_FAIL    =  35
+EXPOSURE_DARK_WARN    =  70
+EXPOSURE_BRIGHT_WARN  = 195
+EXPOSURE_BRIGHT_FAIL  = 225
+SATURATED_HIGH_FAIL = 0.10
+SATURATED_HIGH_WARN = 0.03
+SATURATED_LOW_FAIL  = 0.10
+SATURATED_LOW_WARN  = 0.03
+DYNAMIC_RANGE_FAIL =  60
+DYNAMIC_RANGE_WARN = 100
+TILE_CV_FAIL = 0.25
+TILE_CV_WARN = 0.12
+
+NOISE_SIGMA_FAIL = 14.0
+NOISE_SIGMA_WARN =  7.0
+SNR_FAIL =  8.0
+SNR_WARN = 18.0
+SP_FAIL = 0.020
+SP_WARN = 0.005
+
+COVERAGE_SPARSE_FAIL =   2.0
+COVERAGE_SPARSE_WARN =   8.0
+COVERAGE_DENSE_WARN  =  50.0
+COVERAGE_DENSE_FAIL  =  68.0
+DENSITY_CV_FAIL = 1.20
+DENSITY_CV_WARN = 0.70
+TOUCHING_FAIL = 0.55
+TOUCHING_WARN = 0.30
+
+WEIGHT_BLUR     = 0.35
+WEIGHT_EXPOSURE = 0.20
+WEIGHT_NOISE    = 0.20
+WEIGHT_DENSITY  = 0.25
+
+SCORE_PASS     = 75.0
+SCORE_REVIEW   = 55.0
+
+
+# ═══════════ DATA CLASSES ═══════════
+@dataclass
+class Finding:
+    rule_id: str
+    severity: str
+    metric: str
+    measured: float
+    threshold: float
+    operator: str
+    message: str
+    impact: str
 
 @dataclass
 class MetricResult:
+    name: str
     score: float
-    raw: dict
-    issues: list
     severity: str
+    measurements: dict
+    findings: list
 
+@dataclass
+class Verdict:
+    decision: str
+    confidence: float
+    reasoning: list
+    blockers: list
 
 @dataclass
 class QualityReport:
-    blur:     MetricResult = None
-    lighting: MetricResult = None
-    noise:    MetricResult = None
-    density:  MetricResult = None
-    overall_score: float = 0.0
-    label: str = ""
-    summary: list = field(default_factory=list)
+    version: str
+    timestamp: str
+    image_info: dict
+    metrics: dict
+    overall_score: float
+    verdict: Verdict
     annotated_image: Optional[np.ndarray] = None
     heatmap_image:   Optional[np.ndarray] = None
     histogram_data:  Optional[dict] = None
 
 
-# ══════════════════════════════════════════════
-# 1. BLUR
-# ══════════════════════════════════════════════
-def _brenner_gradient(gray):
-    diff_h = gray[2:, :].astype(np.float32) - gray[:-2, :].astype(np.float32)
-    diff_v = gray[:, 2:].astype(np.float32) - gray[:, :-2].astype(np.float32)
-    return float(np.mean(diff_h ** 2) + np.mean(diff_v ** 2))
-
-
-def analyze_blur(gray):
-    lap_var   = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-    brenner   = _brenner_gradient(gray)
-    sx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-    sy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-    tenengrad = float(np.mean(sx**2 + sy**2))
-
-    s1 = np.clip((lap_var  - BLUR_BAD)  / (BLUR_GOOD  - BLUR_BAD)  * 100, 0, 100)
-    s2 = np.clip((brenner  - 50)        / (2000 - 50)               * 100, 0, 100)
-    s3 = np.clip((tenengrad - 50)       / (3000 - 50)               * 100, 0, 100)
-    score = float((s1 + s2 + s3) / 3)
-
-    issues = []
-    if lap_var < BLUR_BAD:
-        severity = "critical"
-        issues.append(f"Severe blur detected (Laplacian variance {lap_var:.1f} < {BLUR_BAD})")
-    elif lap_var < BLUR_GOOD * 0.5:
-        severity = "warning"
-        issues.append(f"Mild blur detected (Laplacian variance {lap_var:.1f})")
+# ═══════════ HELPERS ═══════════
+def _band_score(value, fail, warn, pass_, higher_is_better=True):
+    if higher_is_better:
+        if value <= fail:  return max(0.0, (value / fail) * 30)
+        if value <= warn:  return 30 + (value - fail) / (warn - fail) * 30
+        if value <= pass_: return 60 + (value - warn) / (pass_ - warn) * 30
+        return min(100.0, 90 + (value - pass_) / pass_ * 10)
     else:
-        severity = "ok"
+        if value >= fail:  return max(0.0, 30 - (value - fail) / fail * 30)
+        if value >= warn:  return 30 + (fail - value) / (fail - warn) * 30
+        if value >= pass_: return 60 + (warn - value) / (warn - pass_) * 30
+        return min(100.0, 90 + (pass_ - value) / pass_ * 10)
 
-    return MetricResult(
-        score=round(score, 1),
-        raw={"laplacian_var": round(lap_var, 2), "brenner": round(brenner, 2), "tenengrad": round(tenengrad, 2)},
-        issues=issues, severity=severity,
-    )
-
-
-# ══════════════════════════════════════════════
-# 2. LIGHTING
-# ══════════════════════════════════════════════
-def _tile_brightness(gray, tiles=4):
-    h, w = gray.shape
-    th, tw = h // tiles, w // tiles
-    vals = []
-    for r in range(tiles):
-        for c in range(tiles):
-            tile = gray[r*th:(r+1)*th, c*tw:(c+1)*tw]
-            vals.append(float(np.mean(tile)))
-    return np.array(vals)
+def _worst(severities):
+    if "fail" in severities: return "fail"
+    if "warn" in severities: return "warn"
+    return "pass"
 
 
-def analyze_lighting(gray):
-    mean_b = float(np.mean(gray))
-    std_b  = float(np.std(gray))
-    tile_means = _tile_brightness(gray, tiles=4)
-    tile_cv    = float(np.std(tile_means) / (np.mean(tile_means) + 1e-6))
-    sat_frac   = float(np.mean(gray > 250)) * 100
+# ═══════════ 1. BLUR ═══════════
+def analyze_blur(gray):
+    g = gray.astype(np.float32)
+    lap = cv2.Laplacian(g, cv2.CV_32F, ksize=3)
+    lap_var = float(lap.var())
+    sx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+    sy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = np.sqrt(sx*sx + sy*sy)
+    tenengrad = float(np.mean(grad_mag ** 2))
+    grad_8u = cv2.normalize(grad_mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, edges = cv2.threshold(grad_8u, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    edge_density = float(np.count_nonzero(edges)) / edges.size
 
-    issues, score = [], 100.0
-
-    if mean_b < BRIGHT_LOW:
-        score -= (BRIGHT_LOW - mean_b) / BRIGHT_LOW * 55
-        issues.append(f"Image severely under-exposed (mean brightness {mean_b:.0f}/255)")
-    elif mean_b < BRIGHT_IDEAL_LO:
-        score -= (BRIGHT_IDEAL_LO - mean_b) / BRIGHT_IDEAL_LO * 25
-        issues.append(f"Image slightly dark (mean brightness {mean_b:.0f}/255)")
-    elif mean_b > BRIGHT_HIGH:
-        score -= (mean_b - BRIGHT_HIGH) / (255 - BRIGHT_HIGH) * 55
-        issues.append(f"Image over-exposed / saturated (mean brightness {mean_b:.0f}/255)")
-    elif mean_b > BRIGHT_IDEAL_HI:
-        score -= (mean_b - BRIGHT_IDEAL_HI) / (BRIGHT_HIGH - BRIGHT_IDEAL_HI) * 25
-        issues.append(f"Image slightly bright (mean brightness {mean_b:.0f}/255)")
-
-    if tile_cv > 0.18:
-        score -= min(35, tile_cv * 100)
-        issues.append(f"Uneven illumination across image (tile CV = {tile_cv:.2f})")
-    elif tile_cv > 0.10:
-        score -= 12
-        issues.append(f"Mild illumination gradient detected (tile CV = {tile_cv:.2f})")
-
-    if sat_frac > 5:
-        score -= min(20, sat_frac)
-        issues.append(f"{sat_frac:.1f}% pixels fully saturated")
-
-    score = max(0.0, min(100.0, score))
-    severity = "ok" if score >= 75 else ("warning" if score >= 45 else "critical")
-
-    return MetricResult(
-        score=round(score, 1),
-        raw={"mean_brightness": round(mean_b, 1), "std_brightness": round(std_b, 1),
-             "tile_cv": round(tile_cv, 3), "saturation_pct": round(sat_frac, 2)},
-        issues=issues, severity=severity,
-    )
-
-
-# ══════════════════════════════════════════════
-# 3. NOISE
-# ══════════════════════════════════════════════
-def _estimate_noise_sigma(gray):
-    H = np.array([[1,-2,1],[-2,4,-2],[1,-2,1]], dtype=np.float32)
-    filtered = cv2.filter2D(gray.astype(np.float32), -1, H)
-    sigma = np.sqrt(np.pi / 2) * np.mean(np.abs(filtered)) / 6
-    return float(sigma)
-
-
-def _ringing_artifacts(gray):
-    f = np.fft.fft2(gray.astype(np.float32))
+    f = np.fft.fft2(g)
     mag = np.abs(np.fft.fftshift(f))
     h, w = mag.shape
-    cy, cx = h//2, w//2
-    y, x = np.ogrid[:h, :w]
-    r = np.sqrt((x-cx)**2 + (y-cy)**2)
-    hf = float(np.sum(mag[r > min(h,w)*0.3]))
-    return hf / (float(np.sum(mag)) + 1e-9)
+    Y, X = np.ogrid[:h, :w]
+    r = np.sqrt((X - w//2)**2 + (Y - h//2)**2)
+    cutoff = min(h, w) * 0.15
+    hf_ratio = float(mag[r > cutoff].sum()) / (float(mag.sum()) + 1e-9)
 
+    s_lv  = _band_score(lap_var,    BLUR_LV_FAIL, BLUR_LV_WARN, BLUR_LV_PASS, True)
+    s_ten = _band_score(tenengrad,  TEN_FAIL,     TEN_WARN,     TEN_PASS,     True)
+    s_ed  = _band_score(edge_density, EDGE_DENSITY_FAIL, EDGE_DENSITY_WARN, 0.10, True)
+    score = round(0.55*s_lv + 0.25*s_ten + 0.20*s_ed, 1)
 
-def analyze_noise(gray):
-    sigma      = _estimate_noise_sigma(gray)
-    ring_ratio = _ringing_artifacts(gray)
-    snr        = float(np.mean(gray)) / (sigma + 1e-6)
-    sp_frac    = float(np.mean((gray < 5) | (gray > 250))) * 100
+    findings = []
+    if lap_var < BLUR_LV_FAIL:
+        findings.append(Finding("BLUR.LV.FAIL","fail","laplacian_variance",
+            round(lap_var,2),BLUR_LV_FAIL,"<",
+            f"Severe defocus or motion blur (LV={lap_var:.1f})",
+            "Cell boundaries cannot be reliably segmented."))
+    elif lap_var < BLUR_LV_WARN:
+        findings.append(Finding("BLUR.LV.WARN","warn","laplacian_variance",
+            round(lap_var,2),BLUR_LV_WARN,"<",
+            f"Mild blur detected (LV={lap_var:.1f})",
+            "Fine subcellular structures may be lost."))
+    else:
+        findings.append(Finding("BLUR.LV.PASS","pass","laplacian_variance",
+            round(lap_var,2),BLUR_LV_WARN,"≥",
+            f"Image is in focus (LV={lap_var:.1f})",
+            "Sufficient sharpness for analysis."))
 
-    issues, score = [], 100.0
+    if tenengrad < TEN_FAIL and lap_var < BLUR_LV_WARN:
+        findings.append(Finding("BLUR.TEN.CONFIRM","fail","tenengrad",
+            round(tenengrad,1),TEN_FAIL,"<",
+            "Tenengrad confirms low gradient energy",
+            "Independent confirmation of blur."))
 
-    if sigma > NOISE_BAD:
-        score -= min(45, (sigma - NOISE_BAD) / NOISE_BAD * 45)
-        issues.append(f"High noise level (σ = {sigma:.1f}, SNR = {snr:.1f})")
-    elif sigma > NOISE_GOOD * 2:
-        score -= 18
-        issues.append(f"Moderate noise present (σ = {sigma:.1f})")
-
-    if sp_frac > 0.5:
-        score -= min(30, sp_frac * 8)
-        issues.append(f"Salt-and-pepper artifacts: {sp_frac:.2f}% pixels")
-
-    if ring_ratio > 0.45:
-        score -= 15
-        issues.append("Ringing/compression artifacts in frequency domain")
-
-    score = max(0.0, min(100.0, score))
-    severity = "ok" if score >= 75 else ("warning" if score >= 45 else "critical")
+    if edge_density < EDGE_DENSITY_FAIL:
+        findings.append(Finding("BLUR.EDGES.FAIL","fail","edge_density",
+            round(edge_density,4),EDGE_DENSITY_FAIL,"<",
+            f"Almost no detectable edges ({edge_density*100:.2f}%)",
+            "Image lacks expected cell structure."))
 
     return MetricResult(
-        score=round(score, 1),
-        raw={"noise_sigma": round(sigma, 2), "snr": round(snr, 2),
-             "sp_artifact_pct": round(sp_frac, 3), "hf_ring_ratio": round(ring_ratio, 3)},
-        issues=issues, severity=severity,
+        name="Sharpness",
+        score=max(0.0, min(100.0, score)),
+        severity=_worst([f.severity for f in findings]),
+        measurements={
+            "laplacian_variance": round(lap_var,2),
+            "tenengrad": round(tenengrad,1),
+            "edge_density": round(edge_density,4),
+            "hf_energy_ratio": round(hf_ratio,4),
+        },
+        findings=findings,
     )
 
 
-# ══════════════════════════════════════════════
-# 4. CELL DENSITY
-# ══════════════════════════════════════════════
+# ═══════════ 2. EXPOSURE ═══════════
+def analyze_exposure(gray):
+    g = gray.astype(np.float32)
+    findings = []
+
+    mean_v = float(g.mean())
+    p1, p99 = np.percentile(g, [1, 99])
+    dyn_range = float(p99 - p1)
+    sat_high = float(np.mean(gray >= 254))
+    sat_low  = float(np.mean(gray <= 1))
+
+    h, w = gray.shape
+    tiles = 5
+    th, tw = h // tiles, w // tiles
+    tile_means = []
+    for r in range(tiles):
+        for c in range(tiles):
+            tile = g[r*th:(r+1)*th, c*tw:(c+1)*tw]
+            tile_means.append(tile.mean())
+    tile_means = np.array(tile_means, dtype=np.float32)
+    tile_cv = float(tile_means.std() / (tile_means.mean() + 1e-6))
+
+    small = cv2.resize(g, (64,64), interpolation=cv2.INTER_AREA)
+    Y, X = np.mgrid[0:64, 0:64].astype(np.float32)
+    A = np.column_stack([X.ravel()**2, Y.ravel()**2, (X*Y).ravel(),
+                         X.ravel(), Y.ravel(), np.ones(64*64)])
+    coef, *_ = np.linalg.lstsq(A, small.ravel(), rcond=None)
+    surface = (A @ coef).reshape(64,64)
+    vignette_strength = float((surface.max() - surface.min()) / (mean_v + 1e-6))
+
+    if mean_v < EXPOSURE_DARK_FAIL or mean_v > EXPOSURE_BRIGHT_FAIL:
+        s_exp = 0
+    elif mean_v < EXPOSURE_DARK_WARN:
+        s_exp = 30 + (mean_v - EXPOSURE_DARK_FAIL) / (EXPOSURE_DARK_WARN - EXPOSURE_DARK_FAIL) * 30
+    elif mean_v > EXPOSURE_BRIGHT_WARN:
+        s_exp = 30 + (EXPOSURE_BRIGHT_FAIL - mean_v) / (EXPOSURE_BRIGHT_FAIL - EXPOSURE_BRIGHT_WARN) * 30
+    else:
+        s_exp = 100
+
+    s_uni = _band_score(tile_cv, TILE_CV_FAIL, TILE_CV_WARN, 0.04, False)
+    s_dr  = _band_score(dyn_range, DYNAMIC_RANGE_FAIL, DYNAMIC_RANGE_WARN, 200, True)
+
+    sat_penalty = 0
+    if sat_high > SATURATED_HIGH_FAIL: sat_penalty += 30
+    elif sat_high > SATURATED_HIGH_WARN: sat_penalty += 12
+    if sat_low > SATURATED_LOW_FAIL: sat_penalty += 30
+    elif sat_low > SATURATED_LOW_WARN: sat_penalty += 12
+
+    score = round(0.50*s_exp + 0.30*s_uni + 0.20*s_dr - sat_penalty, 1)
+    score = max(0.0, min(100.0, score))
+
+    if mean_v < EXPOSURE_DARK_FAIL:
+        findings.append(Finding("EXPOSURE.UNDER.FAIL","fail","mean_intensity",
+            round(mean_v,1),EXPOSURE_DARK_FAIL,"<",
+            f"Severely underexposed (mean = {mean_v:.0f}/255)",
+            "Cell features may be lost in noise floor."))
+    elif mean_v < EXPOSURE_DARK_WARN:
+        findings.append(Finding("EXPOSURE.UNDER.WARN","warn","mean_intensity",
+            round(mean_v,1),EXPOSURE_DARK_WARN,"<",
+            f"Image is dim (mean = {mean_v:.0f}/255)",
+            "Reduced contrast for staining-based identification."))
+    elif mean_v > EXPOSURE_BRIGHT_FAIL:
+        findings.append(Finding("EXPOSURE.OVER.FAIL","fail","mean_intensity",
+            round(mean_v,1),EXPOSURE_BRIGHT_FAIL,">",
+            f"Severely overexposed (mean = {mean_v:.0f}/255)",
+            "Highlights clipped — cell detail unrecoverable."))
+    elif mean_v > EXPOSURE_BRIGHT_WARN:
+        findings.append(Finding("EXPOSURE.OVER.WARN","warn","mean_intensity",
+            round(mean_v,1),EXPOSURE_BRIGHT_WARN,">",
+            f"Image is bright (mean = {mean_v:.0f}/255)",
+            "Risk of clipping in light cell regions."))
+    else:
+        findings.append(Finding("EXPOSURE.OK","pass","mean_intensity",
+            round(mean_v,1),EXPOSURE_BRIGHT_WARN,"in_range",
+            f"Exposure within target range (mean = {mean_v:.0f})",
+            "Good histogram placement."))
+
+    if sat_high > SATURATED_HIGH_FAIL:
+        findings.append(Finding("EXPOSURE.CLIP.HIGH.FAIL","fail","saturated_high_fraction",
+            round(sat_high,4),SATURATED_HIGH_FAIL,">",
+            f"{sat_high*100:.1f}% of pixels are blown out (=255)",
+            "Loss of detail in bright regions."))
+    elif sat_high > SATURATED_HIGH_WARN:
+        findings.append(Finding("EXPOSURE.CLIP.HIGH.WARN","warn","saturated_high_fraction",
+            round(sat_high,4),SATURATED_HIGH_WARN,">",
+            f"{sat_high*100:.1f}% pixels at maximum value",
+            "Some highlight clipping."))
+    if sat_low > SATURATED_LOW_FAIL:
+        findings.append(Finding("EXPOSURE.CLIP.LOW.FAIL","fail","saturated_low_fraction",
+            round(sat_low,4),SATURATED_LOW_FAIL,">",
+            f"{sat_low*100:.1f}% of pixels are crushed to black",
+            "Loss of detail in shadow regions."))
+
+    if tile_cv > TILE_CV_FAIL:
+        findings.append(Finding("EXPOSURE.UNIFORM.FAIL","fail","tile_cv",
+            round(tile_cv,3),TILE_CV_FAIL,">",
+            f"Strong illumination gradient (CV={tile_cv:.2f})",
+            "Vignette or uneven lighting; consider flat-field correction."))
+    elif tile_cv > TILE_CV_WARN:
+        findings.append(Finding("EXPOSURE.UNIFORM.WARN","warn","tile_cv",
+            round(tile_cv,3),TILE_CV_WARN,">",
+            f"Mild illumination unevenness (CV={tile_cv:.2f})",
+            "Edge regions may have biased measurements."))
+
+    if dyn_range < DYNAMIC_RANGE_FAIL:
+        findings.append(Finding("EXPOSURE.DR.FAIL","fail","dynamic_range",
+            round(dyn_range,1),DYNAMIC_RANGE_FAIL,"<",
+            f"Compressed dynamic range ({dyn_range:.0f}/255)",
+            "Low contrast — staining differentiation impaired."))
+    elif dyn_range < DYNAMIC_RANGE_WARN:
+        findings.append(Finding("EXPOSURE.DR.WARN","warn","dynamic_range",
+            round(dyn_range,1),DYNAMIC_RANGE_WARN,"<",
+            f"Limited dynamic range ({dyn_range:.0f}/255)",
+            "Lower contrast than ideal."))
+
+    return MetricResult(
+        name="Lighting",
+        score=score,
+        severity=_worst([f.severity for f in findings]),
+        measurements={
+            "mean_intensity": round(mean_v,1),
+            "p1": round(float(p1),1),
+            "p99": round(float(p99),1),
+            "dynamic_range": round(dyn_range,1),
+            "saturated_high_pct": round(sat_high*100,3),
+            "saturated_low_pct": round(sat_low*100,3),
+            "tile_cv": round(tile_cv,3),
+            "vignette_strength": round(vignette_strength,3),
+        },
+        findings=findings,
+    )
+
+
+# ═══════════ 3. NOISE ═══════════
+def _immerkaer_sigma(gray):
+    H = np.array([[1,-2,1],[-2,4,-2],[1,-2,1]], dtype=np.float32)
+    conv = cv2.filter2D(gray.astype(np.float32), -1, H)
+    return float(np.sqrt(np.pi/2) * np.mean(np.abs(conv)) / 6.0)
+
+def _salt_pepper_fraction(gray):
+    g = gray.astype(np.int16)
+    extreme = (gray <= 1) | (gray >= 254)
+    if not extreme.any(): return 0.0
+    kernel = np.ones((3,3), dtype=np.float32) / 8.0
+    kernel[1,1] = 0
+    neighbour_mean = cv2.filter2D(g.astype(np.float32), -1, kernel)
+    isolation = np.abs(g - neighbour_mean) > 80
+    sp = extreme & isolation
+    return float(np.count_nonzero(sp)) / gray.size
+
+def analyze_noise(gray):
+    sigma = _immerkaer_sigma(gray)
+    mean_v = float(np.mean(gray))
+    snr = mean_v / (sigma + 1e-6)
+    sp_frac = _salt_pepper_fraction(gray)
+    h, w = gray.shape
+    background_std = float(gray[0:h//5, 0:w//5].astype(np.float32).std())
+
+    s_sigma = _band_score(sigma, NOISE_SIGMA_FAIL, NOISE_SIGMA_WARN, 2.0, False)
+    s_snr   = _band_score(snr, SNR_FAIL, SNR_WARN, 50, True)
+    s_sp    = 100 - min(100, sp_frac * 5000)
+    score = round(0.45*s_sigma + 0.35*s_snr + 0.20*s_sp, 1)
+    score = max(0.0, min(100.0, score))
+
+    findings = []
+    if sigma >= NOISE_SIGMA_FAIL:
+        findings.append(Finding("NOISE.SIGMA.FAIL","fail","noise_sigma",
+            round(sigma,2),NOISE_SIGMA_FAIL,"≥",
+            f"High noise level (σ = {sigma:.1f})",
+            "Cell boundaries obscured by sensor noise."))
+    elif sigma >= NOISE_SIGMA_WARN:
+        findings.append(Finding("NOISE.SIGMA.WARN","warn","noise_sigma",
+            round(sigma,2),NOISE_SIGMA_WARN,"≥",
+            f"Moderate noise (σ = {sigma:.1f})",
+            "Some texture features may be obscured."))
+    else:
+        findings.append(Finding("NOISE.SIGMA.PASS","pass","noise_sigma",
+            round(sigma,2),NOISE_SIGMA_WARN,"<",
+            f"Low noise (σ = {sigma:.1f})",
+            "Clean signal."))
+
+    if snr < SNR_FAIL:
+        findings.append(Finding("NOISE.SNR.FAIL","fail","snr",
+            round(snr,1),SNR_FAIL,"<",
+            f"Poor SNR ({snr:.1f})",
+            "Signal barely above noise floor."))
+    elif snr < SNR_WARN:
+        findings.append(Finding("NOISE.SNR.WARN","warn","snr",
+            round(snr,1),SNR_WARN,"<",
+            f"Marginal SNR ({snr:.1f})",
+            "Reduced confidence in pixel-level features."))
+
+    if sp_frac >= SP_FAIL:
+        findings.append(Finding("NOISE.SALTPEPPER.FAIL","fail","sp_fraction",
+            round(sp_frac,4),SP_FAIL,"≥",
+            f"Salt-and-pepper artifacts: {sp_frac*100:.2f}% of pixels",
+            "Suggests sensor defects, transmission errors, or compression."))
+    elif sp_frac >= SP_WARN:
+        findings.append(Finding("NOISE.SALTPEPPER.WARN","warn","sp_fraction",
+            round(sp_frac,4),SP_WARN,"≥",
+            f"Some salt-and-pepper noise ({sp_frac*100:.2f}%)",
+            "Median filter recommended."))
+
+    return MetricResult(
+        name="Noise",
+        score=score,
+        severity=_worst([f.severity for f in findings]),
+        measurements={
+            "sigma": round(sigma,2),
+            "snr": round(snr,2),
+            "salt_pepper_pct": round(sp_frac*100,3),
+            "background_std": round(background_std,2),
+        },
+        findings=findings,
+    )
+
+
+# ═══════════ 4. DENSITY ═══════════
 def analyze_density(gray, original_bgr):
     h, w = gray.shape
-
-    blur   = cv2.GaussianBlur(gray, (5,5), 0)
-    thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY_INV, blockSize=31, C=6)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8,8))
+    enhanced = clahe.apply(gray)
+    thresh = cv2.adaptiveThreshold(
+        cv2.GaussianBlur(enhanced, (5,5), 0),
+        255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, blockSize=35, C=8
+    )
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
-    mask   = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask   = cv2.morphologyEx(mask,   cv2.MORPH_OPEN,  kernel, iterations=1)
+    clean = cv2.morphologyEx(thresh, cv2.MORPH_OPEN,  kernel, iterations=1)
+    clean = cv2.morphologyEx(clean,  cv2.MORPH_CLOSE, kernel, iterations=2)
 
-    coverage = float(np.mean(mask > 0)) * 100
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(clean, 8)
+    img_area = h * w
+    keep_mask = np.zeros_like(clean)
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if (img_area * 0.00005) < area < (img_area * 0.05):
+            keep_mask[labels == i] = 255
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    min_area = (h * w) * 0.0001
-    max_area = (h * w) * 0.10
-    cells = [c for c in contours if min_area < cv2.contourArea(c) < max_area]
-    cell_count = len(cells)
+    coverage = float(np.mean(keep_mask > 0)) * 100
 
-    # Density heatmap grid
+    dist = cv2.distanceTransform(keep_mask, cv2.DIST_L2, 5)
+    if dist.max() > 0:
+        _, sure_fg = cv2.threshold(dist, 0.45 * dist.max(), 255, 0)
+        sure_fg = sure_fg.astype(np.uint8)
+        n_cells, _ = cv2.connectedComponents(sure_fg)
+        cell_count = max(0, n_cells - 1)
+    else:
+        cell_count = 0
+
+    contours, _ = cv2.findContours(keep_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    touching = 0
+    valid_contours = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < img_area * 0.0001: continue
+        valid_contours.append(c)
+        hull = cv2.convexHull(c)
+        ha = cv2.contourArea(hull)
+        if ha > 0:
+            solidity = area / ha
+            if solidity < 0.85:
+                touching += 1
+    touching_frac = touching / max(1, len(valid_contours))
+
     grid_r, grid_c = 6, 6
-    tile_h, tile_w = h // grid_r, w // grid_c
-    density_grid   = np.zeros((grid_r, grid_c), dtype=np.float32)
-    for c in cells:
+    th, tw = h // grid_r, w // grid_c
+    density_grid = np.zeros((grid_r, grid_c), dtype=np.float32)
+    for c in valid_contours:
         M = cv2.moments(c)
         if M["m00"] > 0:
-            cx_ = int(M["m10"] / M["m00"])
-            cy_ = int(M["m01"] / M["m00"])
-            density_grid[min(cy_//tile_h, grid_r-1), min(cx_//tile_w, grid_c-1)] += 1
+            cx, cy = int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"])
+            density_grid[min(cy//th, grid_r-1), min(cx//tw, grid_c-1)] += 1
+    g_mean = float(density_grid.mean())
+    density_cv = float(density_grid.std() / (g_mean + 1e-6)) if g_mean > 0 else 0.0
 
-    grid_mean  = float(np.mean(density_grid))
-    density_cv = float(np.std(density_grid)) / (grid_mean + 1e-6)
-
-    # Heatmap overlay
-    heatmap_norm = cv2.resize(density_grid, (w,h), interpolation=cv2.INTER_LINEAR)
-    if heatmap_norm.max() > 0:
-        heatmap_norm = (heatmap_norm / heatmap_norm.max() * 255)
-    heatmap_uint8   = np.clip(heatmap_norm, 0, 255).astype(np.uint8)
-    heatmap_color   = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_INFERNO)
+    if density_grid.max() > 0:
+        norm = density_grid / density_grid.max() * 255
+    else:
+        norm = density_grid
+    norm_resized = cv2.resize(norm, (w,h), interpolation=cv2.INTER_LINEAR)
+    heatmap_uint8 = np.clip(norm_resized, 0, 255).astype(np.uint8)
+    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_INFERNO)
     heatmap_overlay = cv2.addWeighted(original_bgr, 0.55, heatmap_color, 0.45, 0)
 
-    # Annotated image
     annotated = original_bgr.copy()
-    for c in cells:
-        (cx_, cy_), radius = cv2.minEnclosingCircle(c)
-        cv2.circle(annotated, (int(cx_), int(cy_)), int(radius)+2, (0,230,180), 1, lineType=cv2.LINE_AA)
+    for c in valid_contours:
+        (cx, cy), radius = cv2.minEnclosingCircle(c)
+        cv2.circle(annotated, (int(cx), int(cy)), int(radius)+2, (0,230,180), 1, lineType=cv2.LINE_AA)
 
-    issues, score = [], 100.0
+    if coverage < COVERAGE_SPARSE_FAIL:
+        s_cov = 5
+    elif coverage < COVERAGE_SPARSE_WARN:
+        s_cov = 30 + (coverage - COVERAGE_SPARSE_FAIL) / (COVERAGE_SPARSE_WARN - COVERAGE_SPARSE_FAIL) * 30
+    elif coverage <= COVERAGE_DENSE_WARN:
+        s_cov = 100
+    elif coverage <= COVERAGE_DENSE_FAIL:
+        s_cov = 30 + (COVERAGE_DENSE_FAIL - coverage) / (COVERAGE_DENSE_FAIL - COVERAGE_DENSE_WARN) * 30
+    else:
+        s_cov = 5
 
-    if coverage < DENSITY_SPARSE:
-        score -= 45
-        issues.append(f"Region too sparse — very few cells ({coverage:.1f}% coverage, ~{cell_count} cells)")
-    elif coverage < DENSITY_IDEAL_LO:
-        score -= 18
-        issues.append(f"Low cell density ({coverage:.1f}% coverage, ~{cell_count} cells)")
-    elif coverage > DENSITY_DENSE:
-        score -= 40
-        issues.append(f"Overcrowded — cells heavily overlapping ({coverage:.1f}% coverage)")
-    elif coverage > DENSITY_IDEAL_HI:
-        score -= 18
-        issues.append(f"High cell density — segmentation may be unreliable ({coverage:.1f}% coverage)")
+    s_cv = _band_score(density_cv, DENSITY_CV_FAIL, DENSITY_CV_WARN, 0.25, False)
+    s_touch = _band_score(touching_frac, TOUCHING_FAIL, TOUCHING_WARN, 0.10, False)
 
-    if density_cv > DENSITY_CV_THRESH:
-        score -= min(30, density_cv * 30)
-        issues.append(f"Uneven cell distribution — clustered regions (spatial CV = {density_cv:.2f})")
-
+    score = round(0.55*s_cov + 0.25*s_cv + 0.20*s_touch, 1)
     score = max(0.0, min(100.0, score))
-    severity = "ok" if score >= 75 else ("warning" if score >= 45 else "critical")
 
-    return (
-        MetricResult(
-            score=round(score, 1),
-            raw={"coverage_pct": round(coverage, 2), "approx_cell_count": cell_count,
-                 "density_cv": round(density_cv, 3)},
-            issues=issues, severity=severity,
-        ),
-        annotated,
-        heatmap_overlay,
+    findings = []
+    if coverage < COVERAGE_SPARSE_FAIL:
+        findings.append(Finding("DENSITY.SPARSE.FAIL","fail","coverage_pct",
+            round(coverage,2),COVERAGE_SPARSE_FAIL,"<",
+            f"Field is essentially empty ({coverage:.1f}% coverage, ~{cell_count} cells)",
+            "Insufficient sample for analysis."))
+    elif coverage < COVERAGE_SPARSE_WARN:
+        findings.append(Finding("DENSITY.SPARSE.WARN","warn","coverage_pct",
+            round(coverage,2),COVERAGE_SPARSE_WARN,"<",
+            f"Sparse field ({coverage:.1f}% coverage, ~{cell_count} cells)",
+            "Larger field of view recommended."))
+    elif coverage > COVERAGE_DENSE_FAIL:
+        findings.append(Finding("DENSITY.DENSE.FAIL","fail","coverage_pct",
+            round(coverage,2),COVERAGE_DENSE_FAIL,">",
+            f"Severely overcrowded ({coverage:.1f}% coverage)",
+            "Heavy overlap prevents reliable single-cell segmentation."))
+    elif coverage > COVERAGE_DENSE_WARN:
+        findings.append(Finding("DENSITY.DENSE.WARN","warn","coverage_pct",
+            round(coverage,2),COVERAGE_DENSE_WARN,">",
+            f"High cell density ({coverage:.1f}% coverage)",
+            "Some cell overlap; counting may be less accurate."))
+    else:
+        findings.append(Finding("DENSITY.OK","pass","coverage_pct",
+            round(coverage,2),COVERAGE_DENSE_WARN,"in_range",
+            f"Optimal cell density ({coverage:.1f}% coverage, ~{cell_count} cells)",
+            "Ideal monolayer for analysis."))
+
+    if density_cv > DENSITY_CV_FAIL:
+        findings.append(Finding("DENSITY.UNIFORM.FAIL","fail","spatial_cv",
+            round(density_cv,3),DENSITY_CV_FAIL,">",
+            f"Cells highly clustered (spatial CV = {density_cv:.2f})",
+            "Some grid regions empty, others packed; non-representative."))
+    elif density_cv > DENSITY_CV_WARN:
+        findings.append(Finding("DENSITY.UNIFORM.WARN","warn","spatial_cv",
+            round(density_cv,3),DENSITY_CV_WARN,">",
+            f"Uneven cell distribution (CV = {density_cv:.2f})",
+            "Avoid sampling local clusters."))
+
+    if touching_frac > TOUCHING_FAIL:
+        findings.append(Finding("DENSITY.TOUCHING.FAIL","fail","touching_fraction",
+            round(touching_frac,3),TOUCHING_FAIL,">",
+            f"{touching_frac*100:.0f}% of cells appear touching/overlapping",
+            "Watershed splitting required; counts may be unreliable."))
+
+    metric = MetricResult(
+        name="Density",
+        score=score,
+        severity=_worst([f.severity for f in findings]),
+        measurements={
+            "coverage_pct": round(coverage,2),
+            "cell_count_estimate": int(cell_count),
+            "spatial_cv": round(density_cv,3),
+            "touching_fraction": round(touching_frac,3),
+        },
+        findings=findings,
     )
+    return metric, annotated, heatmap_overlay
 
 
-# ══════════════════════════════════════════════
-# 5. MASTER ANALYSIS
-# ══════════════════════════════════════════════
-def analyze_image(image_bgr: np.ndarray) -> QualityReport:
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+# ═══════════ DECISION ENGINE ═══════════
+def make_verdict(metrics, overall_score):
+    reasoning = []
+    blockers = []
+    critical_findings = []
+    warn_findings = []
+    for key, m in metrics.items():
+        for f in m.findings:
+            if f.severity == "fail": critical_findings.append((key, f))
+            elif f.severity == "warn": warn_findings.append((key, f))
 
-    blur_r    = analyze_blur(gray)
-    light_r   = analyze_lighting(gray)
-    noise_r   = analyze_noise(gray)
-    dens_r, annotated_cells, heatmap = analyze_density(gray, image_bgr)
+    reasoning.append({
+        "step": "1. Aggregate score",
+        "detail": f"Weighted overall score = {overall_score:.1f}/100",
+        "outcome": ("strong" if overall_score >= SCORE_PASS
+                    else "marginal" if overall_score >= SCORE_REVIEW else "weak"),
+    })
+    reasoning.append({
+        "step": "2. Findings audit",
+        "detail": f"{len(critical_findings)} critical, {len(warn_findings)} warning",
+        "outcome": ("blocking" if critical_findings else "clear"),
+    })
 
-    overall = round(float(
-        W_BLUR * blur_r.score +
-        W_LIGHTING * light_r.score +
-        W_NOISE * noise_r.score +
-        W_DENSITY * dens_r.score
-    ), 1)
+    blur_critical = any(f.severity=="fail" for f in metrics["blur"].findings)
+    noise_critical = any(f.severity=="fail" for f in metrics["noise"].findings)
 
-    label   = "GOOD FOR ANALYSIS" if overall >= 60 else "NOT SUITABLE FOR ANALYSIS"
-    summary = blur_r.issues + light_r.issues + noise_r.issues + dens_r.issues
+    if blur_critical:
+        for f in metrics["blur"].findings:
+            if f.severity=="fail": blockers.append(f.rule_id)
+        reasoning.append({"step":"3. Blur veto",
+            "detail":"Critical blur — focus is not recoverable","outcome":"REJECT"})
+        return Verdict("REJECT", 0.95, reasoning, blockers)
 
-    hist_data = {}
+    if noise_critical and metrics["noise"].score < 30:
+        for f in metrics["noise"].findings:
+            if f.severity=="fail": blockers.append(f.rule_id)
+        reasoning.append({"step":"3. Noise veto",
+            "detail":"Critical noise — signal not recoverable","outcome":"REJECT"})
+        return Verdict("REJECT", 0.92, reasoning, blockers)
+
+    if len(critical_findings) >= 2:
+        for cat, f in critical_findings: blockers.append(f.rule_id)
+        reasoning.append({"step":"3. Multiple criticals",
+            "detail":f"{len(critical_findings)} critical issues; not safely correctable","outcome":"REJECT"})
+        return Verdict("REJECT", 0.90, reasoning, blockers)
+
+    if overall_score < SCORE_REVIEW:
+        reasoning.append({"step":"3. Score threshold",
+            "detail":f"Score {overall_score:.1f} below reject threshold ({SCORE_REVIEW})","outcome":"REJECT"})
+        return Verdict("REJECT", 0.85, reasoning,
+            [f.rule_id for _,f in critical_findings])
+
+    if critical_findings or overall_score < SCORE_PASS:
+        for cat, f in critical_findings: blockers.append(f.rule_id)
+        reasoning.append({"step":"3. Borderline",
+            "detail":("One critical issue present" if critical_findings
+                      else f"Score in review band ({SCORE_REVIEW} ≤ {overall_score:.1f} < {SCORE_PASS})"),
+            "outcome":"REVIEW"})
+        confidence = 0.6 + (overall_score - SCORE_REVIEW) / (SCORE_PASS - SCORE_REVIEW) * 0.2
+        return Verdict("REVIEW", round(confidence,2), reasoning, blockers)
+
+    reasoning.append({"step":"3. All checks passed",
+        "detail":f"No critical issues; score {overall_score:.1f} ≥ {SCORE_PASS}","outcome":"PASS"})
+    return Verdict("PASS", round(0.85 + min(0.15, (overall_score-SCORE_PASS)/100), 2), reasoning, [])
+
+
+# ═══════════ MASTER ═══════════
+def analyze_image(image_bgr):
+    if image_bgr is None or image_bgr.size == 0:
+        raise ValueError("Empty image")
+    if len(image_bgr.shape) == 2:
+        gray = image_bgr
+        image_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    else:
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+
+    blur_m = analyze_blur(gray)
+    light_m = analyze_exposure(gray)
+    noise_m = analyze_noise(gray)
+    dens_m, annotated, heatmap = analyze_density(gray, image_bgr)
+
+    overall = round(
+        WEIGHT_BLUR*blur_m.score + WEIGHT_EXPOSURE*light_m.score +
+        WEIGHT_NOISE*noise_m.score + WEIGHT_DENSITY*dens_m.score, 1
+    )
+    metrics = {"blur":blur_m, "lighting":light_m, "noise":noise_m, "density":dens_m}
+    verdict = make_verdict(metrics, overall)
+
+    hist = {}
     for ch_idx, ch_name in enumerate(["Blue","Green","Red"]):
-        h = cv2.calcHist([image_bgr], [ch_idx], None, [256], [0,256])
-        hist_data[ch_name] = h.flatten().tolist()
+        hist[ch_name] = cv2.calcHist([image_bgr],[ch_idx],None,[256],[0,256]).flatten().tolist()
 
     return QualityReport(
-        blur=blur_r, lighting=light_r, noise=noise_r, density=dens_r,
-        overall_score=overall, label=label, summary=summary,
-        annotated_image=annotated_cells, heatmap_image=heatmap,
-        histogram_data=hist_data,
+        version=VERSION,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        image_info={"width":int(image_bgr.shape[1]),"height":int(image_bgr.shape[0]),"channels":int(image_bgr.shape[2])},
+        metrics=metrics,
+        overall_score=overall,
+        verdict=verdict,
+        annotated_image=annotated,
+        heatmap_image=heatmap,
+        histogram_data=hist,
     )
-
-
-# ══════════════════════════════════════════════
-# 6. CLI PRINTER
-# ══════════════════════════════════════════════
-def print_report(report: QualityReport, filename: str = "image"):
-    SEP = "─" * 60
-    W   = 30
-
-    def bar(s):
-        filled = int(s / 100 * W)
-        col = "\033[92m" if s>=75 else ("\033[93m" if s>=45 else "\033[91m")
-        return f"{col}{'█'*filled}{'░'*(W-filled)}\033[0m {s:.1f}/100"
-
-    print(f"\n{SEP}\n  🔬  MicroScope QC  —  {filename}\n{SEP}")
-    lc = "\033[92m" if report.label.startswith("GOOD") else "\033[91m"
-    print(f"\n  Overall Score : {bar(report.overall_score)}")
-    print(f"  Status        : {lc}{report.label}\033[0m\n{SEP}")
-
-    for name, m in [("Sharpness / Blur", report.blur),
-                    ("Lighting / Exposure", report.lighting),
-                    ("Noise / Artifacts", report.noise),
-                    ("Cell Density", report.density)]:
-        icon = {"ok":"✅","warning":"⚠️ ","critical":"❌"}[m.severity]
-        print(f"  {icon}  {name:<22} {bar(m.score)}")
-        for k,v in m.raw.items():
-            print(f"       ↳ {k}: {v}")
-        for issue in m.issues:
-            print(f"       • {issue}")
-
-    print(f"\n{SEP}")
-    if report.summary:
-        print("  Issues found:")
-        for i in report.summary:
-            print(f"    • {i}")
-    else:
-        print("  No significant issues found.")
-    print(SEP + "\n")
