@@ -28,7 +28,7 @@ let currentReport = null;
 
 // ════════════ FILE SELECTION ════════════
 function handleFile(file) {
-  if (!file || !file.type.startsWith('image/')) {
+  if (!file || (file.type && !file.type.startsWith('image/'))) {
     alert('Please select a valid image file.');
     return;
   }
