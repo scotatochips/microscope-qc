@@ -423,78 +423,250 @@ def analyze_noise(gray):
     )
 
 
-# ═══════════ 4. DENSITY ═══════════
-def analyze_density(gray, original_bgr):
-    h, w = gray.shape
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8,8))
-    enhanced = clahe.apply(gray)
-    thresh = cv2.adaptiveThreshold(
-        cv2.GaussianBlur(enhanced, (5,5), 0),
-        255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, blockSize=35, C=8
-    )
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
-    clean = cv2.morphologyEx(thresh, cv2.MORPH_OPEN,  kernel, iterations=1)
-    clean = cv2.morphologyEx(clean,  cv2.MORPH_CLOSE, kernel, iterations=2)
+# ═══════════ 4. DENSITY (RBC-aware multi-method) ═══════════
+def _estimate_background(gray):
+    return float(np.percentile(gray, 90))
 
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(clean, 8)
+
+def _deduplicate_circles(centers, radii, min_dist_factor=0.8):
+    """Remove duplicate Hough detections by merging circles with overlapping centres."""
+    if len(centers) == 0:
+        return centers, radii
+    median_r = float(np.median(radii))
+    min_dist = median_r * min_dist_factor
+    keep = np.ones(len(centers), dtype=bool)
+    for i in range(len(centers)):
+        if not keep[i]: continue
+        for j in range(i + 1, len(centers)):
+            if not keep[j]: continue
+            d = float(np.linalg.norm(centers[i].astype(float) - centers[j].astype(float)))
+            if d < min_dist:
+                if radii[i] >= radii[j]: keep[j] = False
+                else: keep[i] = False; break
+    return centers[keep], radii[keep]
+
+
+def _detect_cells_hough(gray, h, w):
+    """
+    Hough Circle Transform tuned for RBCs.
+    Higher param2 (accumulator threshold) = fewer false positives.
+    minDist = 1.8x min_radius prevents double-counting same cell.
+    """
+    blurred = cv2.medianBlur(gray, 5)
+    min_dim = min(h, w)
+    min_r   = max(6,  int(min_dim * 0.013))
+    max_r   = max(20, int(min_dim * 0.050))
+    min_dist = max(int(min_r * 1.8), 12)
+
+    circles = cv2.HoughCircles(
+        blurred, cv2.HOUGH_GRADIENT,
+        dp=1.2, minDist=min_dist,
+        param1=90, param2=28,
+        minRadius=min_r, maxRadius=max_r,
+    )
+    if circles is None:
+        return np.array([]), np.array([])
+    circles = np.around(circles[0]).astype(int)
+    centers, radii = circles[:, :2], circles[:, 2]
+    return _deduplicate_circles(centers, radii)
+
+
+def _detect_cells_threshold(gray, h, w, bg_intensity):
+    """
+    Adaptive threshold + watershed — fallback for non-round / odd-shaped cells.
+    Auto-detects whether cells are darker or lighter than background.
+    """
     img_area = h * w
+    mean_v = float(gray.mean())
+
+    # Decide if cells are darker (typical staining) or lighter than background
+    cells_darker = mean_v < bg_intensity - 10
+
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+
+    if cells_darker:
+        thresh = cv2.adaptiveThreshold(
+            cv2.GaussianBlur(enhanced, (5, 5), 0),
+            255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, blockSize=51, C=5
+        )
+    else:
+        thresh = cv2.adaptiveThreshold(
+            cv2.GaussianBlur(enhanced, (5, 5), 0),
+            255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, blockSize=51, C=5
+        )
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    clean = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+    clean = cv2.morphologyEx(clean, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    # Filter blobs by size: reject tiny noise and huge background regions
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(clean, 8)
     keep_mask = np.zeros_like(clean)
     for i in range(1, num_labels):
         area = stats[i, cv2.CC_STAT_AREA]
         if (img_area * 0.00005) < area < (img_area * 0.05):
             keep_mask[labels == i] = 255
 
-    coverage = float(np.mean(keep_mask > 0)) * 100
+    return keep_mask
 
-    dist = cv2.distanceTransform(keep_mask, cv2.DIST_L2, 5)
-    if dist.max() > 0:
-        _, sure_fg = cv2.threshold(dist, 0.45 * dist.max(), 255, 0)
-        sure_fg = sure_fg.astype(np.uint8)
-        n_cells, _ = cv2.connectedComponents(sure_fg)
-        cell_count = max(0, n_cells - 1)
+
+def _detect_rbc_donut(gray, h, w):
+    """
+    Specialized RBC detector that matches the donut signature:
+    a darker ring with a lighter center (the central pallor of biconcave RBCs).
+    Uses morphological top-hat to enhance ring structures, then Hough.
+    """
+    # Top-hat highlights small dark structures (cell boundaries)
+    kernel_size = max(15, int(min(h, w) * 0.03))
+    if kernel_size % 2 == 0: kernel_size += 1
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, se)
+    # Enhance and detect circles on the cell-boundary signal
+    enhanced = cv2.normalize(blackhat, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    enhanced = cv2.GaussianBlur(enhanced, (3, 3), 0)
+
+    min_dim = min(h, w)
+    min_r = max(6, int(min_dim * 0.012))
+    max_r = max(20, int(min_dim * 0.055))
+    min_dist = max(8, int(min_r * 1.6))
+
+    circles = cv2.HoughCircles(
+        enhanced,
+        cv2.HOUGH_GRADIENT,
+        dp=1.0,
+        minDist=min_dist,
+        param1=70,
+        param2=20,
+        minRadius=min_r,
+        maxRadius=max_r,
+    )
+    if circles is None:
+        return np.array([]), np.array([])
+    circles = np.around(circles[0]).astype(int)
+    centers, radii = circles[:, :2], circles[:, 2]
+    return _deduplicate_circles(centers, radii)
+
+
+def analyze_density(gray, original_bgr):
+    """
+    Multi-method cell density analysis tuned for blood smears.
+    Strategy:
+      1. Blackhat-enhanced Hough (primary — best for RBC donut shape)
+      2. Standard Hough (secondary confirmation)
+      3. Adaptive threshold mask for true pixel-level coverage
+      4. Touching fraction via nearest-neighbour gap analysis (not overlap)
+    """
+    h, w = gray.shape
+    img_area = h * w
+
+    bg_intensity = _estimate_background(gray)
+
+    # --- METHOD A: blackhat Hough (RBC donuts) — primary ---------
+    centers_b, radii_b = _detect_rbc_donut(gray, h, w)
+    count_b = len(centers_b)
+
+    # --- METHOD B: standard Hough — secondary --------------------
+    centers_a, radii_a = _detect_cells_hough(gray, h, w)
+    count_a = len(centers_a)
+
+    # --- METHOD C: threshold mask for coverage -------------------
+    keep_mask = _detect_cells_threshold(gray, h, w, bg_intensity)
+    coverage_thresh = float(np.mean(keep_mask > 0)) * 100
+
+    # --- Pick best Hough result ----------------------------------
+    if count_b >= count_a:
+        centers, radii, hough_count, method_used = centers_b, radii_b, count_b, "blackhat_hough"
     else:
-        cell_count = 0
+        centers, radii, hough_count, method_used = centers_a, radii_a, count_a, "standard_hough"
 
-    contours, _ = cv2.findContours(keep_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    touching = 0
-    valid_contours = []
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area < img_area * 0.0001: continue
-        valid_contours.append(c)
-        hull = cv2.convexHull(c)
-        ha = cv2.contourArea(hull)
-        if ha > 0:
-            solidity = area / ha
-            if solidity < 0.85:
-                touching += 1
-    touching_frac = touching / max(1, len(valid_contours))
+    if hough_count >= 5:
+        cell_count = hough_count
+        cell_centers = centers
+        cell_radii = radii
 
+        # Coverage: use threshold mask as ground truth for pixel coverage
+        # (circle area sum overcounts because circles overlap)
+        # Blend: 70% threshold mask, 30% circle estimate for robustness
+        circle_area = float(np.sum(np.pi * (radii.astype(float) ** 2)))
+        circle_coverage = min(75.0, (circle_area / img_area) * 100)
+        coverage = round(0.7 * coverage_thresh + 0.3 * circle_coverage, 2)
+        # If threshold failed badly (< 2%), trust circles more
+        if coverage_thresh < 2.0 and circle_coverage > 5.0:
+            coverage = circle_coverage
+    else:
+        # Fallback to threshold watershed
+        dist = cv2.distanceTransform(keep_mask, cv2.DIST_L2, 5)
+        if dist.max() > 0:
+            _, sure_fg = cv2.threshold(dist, 0.45 * dist.max(), 255, 0)
+            n_ws, _ = cv2.connectedComponents(sure_fg.astype(np.uint8))
+            cell_count = max(0, n_ws - 1)
+        else:
+            cell_count = 0
+        coverage = coverage_thresh
+        method_used = "threshold"
+        contours, _ = cv2.findContours(keep_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cell_centers, cell_radii = [], []
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < img_area * 0.0001: continue
+            (cx, cy), r = cv2.minEnclosingCircle(c)
+            cell_centers.append([int(cx), int(cy)])
+            cell_radii.append(int(r))
+        cell_centers = np.array(cell_centers) if cell_centers else np.zeros((0,2), int)
+        cell_radii   = np.array(cell_radii)   if cell_radii   else np.zeros((0,),  int)
+
+    # --- Touching fraction: centre-distance based -------------------
+    # For RBCs, Hough radii are ~10-15% larger than actual cell boundary.
+    # Two cells are "truly touching" only if their centres are closer than
+    # 1.5 × median_radius (i.e. they genuinely overlap, not just adjacent).
+    # Normal well-spread RBCs have centre distances of 1.8-2.5 × radius.
+    if len(cell_centers) > 1 and len(cell_radii) > 0:
+        median_r = float(np.median(cell_radii))
+        # Threshold: centre distance < 1.5 * median_r = genuine overlap
+        touch_dist = median_r * 1.5
+        touching_count = 0
+        n = min(len(cell_centers), 400)
+        for i in range(n):
+            closest = 9999.0
+            for j in range(n):
+                if i == j: continue
+                d = float(np.linalg.norm(
+                    cell_centers[i].astype(float) - cell_centers[j].astype(float)
+                ))
+                if d < closest:
+                    closest = d
+            if closest < touch_dist:
+                touching_count += 1
+        touching_frac = min(1.0, touching_count / n)
+    else:
+        touching_frac = 0.0
+
+    # --- Spatial CV across 6×6 grid -----------------------------
     grid_r, grid_c = 6, 6
     th, tw = h // grid_r, w // grid_c
     density_grid = np.zeros((grid_r, grid_c), dtype=np.float32)
-    for c in valid_contours:
-        M = cv2.moments(c)
-        if M["m00"] > 0:
-            cx, cy = int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"])
-            density_grid[min(cy//th, grid_r-1), min(cx//tw, grid_c-1)] += 1
+    for cx, cy in cell_centers:
+        density_grid[min(cy // th, grid_r - 1), min(cx // tw, grid_c - 1)] += 1
     g_mean = float(density_grid.mean())
     density_cv = float(density_grid.std() / (g_mean + 1e-6)) if g_mean > 0 else 0.0
 
+    # --- Heatmap visualization ----------------------------------
     if density_grid.max() > 0:
         norm = density_grid / density_grid.max() * 255
     else:
         norm = density_grid
-    norm_resized = cv2.resize(norm, (w,h), interpolation=cv2.INTER_LINEAR)
+    norm_resized = cv2.resize(norm, (w, h), interpolation=cv2.INTER_LINEAR)
     heatmap_uint8 = np.clip(norm_resized, 0, 255).astype(np.uint8)
     heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_INFERNO)
     heatmap_overlay = cv2.addWeighted(original_bgr, 0.55, heatmap_color, 0.45, 0)
 
+    # --- Annotated image ----------------------------------------
     annotated = original_bgr.copy()
-    for c in valid_contours:
-        (cx, cy), radius = cv2.minEnclosingCircle(c)
-        cv2.circle(annotated, (int(cx), int(cy)), int(radius)+2, (0,230,180), 1, lineType=cv2.LINE_AA)
+    for (cx, cy), r in zip(cell_centers, cell_radii):
+        cv2.circle(annotated, (int(cx), int(cy)), int(r), (0, 230, 180), 1, lineType=cv2.LINE_AA)
 
     if coverage < COVERAGE_SPARSE_FAIL:
         s_cov = 5
@@ -566,6 +738,7 @@ def analyze_density(gray, original_bgr):
             "cell_count_estimate": int(cell_count),
             "spatial_cv": round(density_cv,3),
             "touching_fraction": round(touching_frac,3),
+            "detection_method": method_used,
         },
         findings=findings,
     )
